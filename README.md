@@ -1,207 +1,241 @@
 # heideltrace
 
-Agen *observability* berbasis eBPF untuk server inferensi LLM (vLLM) pada satu GPU NVIDIA T4.
-Agen ini mengamati interaksi CPU dan GPU **tanpa mengubah kode mesin inferensi, pustaka CUDA, maupun driver GPU**.
-Data yang dikumpulkan dipakai untuk menentukan apakah lonjakan TTFT dan TPOT berasal dari sisi CPU atau dari sisi GPU.
+An eBPF *observability* agent for LLM inference servers (vLLM) on a single NVIDIA T4 GPU.
+It observes the interaction between CPU and GPU **without modifying the inference engine, the CUDA libraries, or the GPU driver**,
+so that TTFT and TPOT spikes can be attributed to the CPU side or the GPU side.
 
-Repositori ini adalah implementasi Tugas Akhir *Observability Kinerja GPU Berbasis eBPF pada Server Inferensi Large Language Model* (Ahmad Wicaksono, 13523121, Teknik Informatika ITB).
-Kode titik pengamatan P1–P8 dan kategori diagnosis mengikuti Bab III proposal.
+This repository implements the undergraduate thesis *Observability Kinerja GPU Berbasis eBPF pada Server Inferensi Large Language Model*
+(Ahmad Wicaksono, 13523121, Informatics, Institut Teknologi Bandung).
+Probe codes P1–P8 and the diagnosis categories follow Chapter III of the proposal.
 
-> **Status:** prototipe awal. Kode sudah dikompilasi, lolos verifier kernel, dan lolos uji asap tanpa GPU (`tests/`), tetapi belum dijalankan terhadap vLLM pada server T4.
-> Daftar fungsi CUDA harus dipastikan dulu dengan `scripts/count_cuda_calls.sh` (lihat [Langkah pemakaian](#langkah-pemakaian)).
+> **Status:** early prototype. The eBPF programs compile and the Go unit tests pass, but the agent has not yet been run against vLLM on a T4 server.
+> Confirm the list of CUDA functions with `scripts/count_cuda_calls.sh` first (see [Usage](#usage)).
 
-## Titik pengamatan yang di-*trace*
+## Architecture
 
-| Kode | Jenis probe | Sasaran | Informasi yang diperoleh | Bawaan |
+```
+bpf/                    eBPF programs (C, CO-RE)
+  lib/                  shared by every program: common.h (ABI), maps.h, helpers.h
+  cuda.bpf.c            P2 P3 P4 P7  uprobes on libcuda.so
+  sched.bpf.c           P5           sched_switch, sched_wakeup
+  proc.bpf.c            P6           fork/exit, PID namespace iterator
+  net.bpf.c             P1           TCP send/receive of the API server
+  ioctl.bpf.c           P8           ioctl syscalls
+  headers/              vendored libbpf headers and vmlinux.h
+cmd/heideltrace/        entry point
+internal/
+  abi/                  Go mirror of bpf/lib/common.h and the CUDA symbol table
+  bpf/                  bpf2go output (compiled objects, committed)
+  loader/               loads the objects, shares the maps between them
+  probes/               attaches kernel hooks and per-PID CUDA uprobes
+  target/               tracks target processes, children, PID namespaces
+  collector/            reads and decodes the ring buffer
+  event/                typed events (the JSON Lines schema)
+  output/               JSON Lines writer
+  agent/                wires the components together and runs the main loop
+  config/               command line options
+scripts/                machine check and CUDA call counting
+tests/                  smoke tests without a GPU
+docs/                   architecture and development guide
+```
+
+Data flows from the kernel to user space:
+
+```
+libcuda.so / scheduler / TCP ──► eBPF programs ──► ring buffer ──► collector ──► target tracker ──► output (JSON Lines)
+                                     │  ▲
+                        per-thread summary + control maps
+```
+
+User space is written in Go with [cilium/ebpf](https://github.com/cilium/ebpf). The eBPF programs are compiled with
+`bpf2go` and embedded in the binary, so the result is **one static binary** with no runtime dependencies.
+See [docs/architecture.md](docs/architecture.md) for how the packages map to the components in the proposal,
+and [docs/development.md](docs/development.md) for how to extend the agent.
+
+## Observation points
+
+| Code | Probe type | Target | What it records | Default |
 |---|---|---|---|---|
-| **P1** | `fentry` | `tcp_sendmsg`, `tcp_cleanup_rbuf`, `tcp_close` pada proses sasaran dengan port lokal API server (bawaan 8000) | Waktu permintaan diterima, waktu setiap token dikirim, dan koneksi ditutup. Dipakai untuk menghitung TTFT dan TPOT dari sisi server | Nyala |
-| **P2** | `uprobe` | `cuLaunchKernel`, `cuLaunchKernelEx`, `cuGraphLaunch` (beserta varian `_ptsz`) di `libcuda.so` | Jumlah peluncuran kernel dan graf, celah antarpeluncuran, celah terpanjang | Nyala |
-| **P3** | `uprobe` + `uretprobe` | `cuStreamSynchronize(_ptsz)`, `cuEventSynchronize`, `cuCtxSynchronize` | Lama CPU menunggu GPU dan batas langkah inferensi | Nyala |
-| **P4** | `uprobe` + `uretprobe` | `cuMemcpy{HtoD,DtoH,DtoD}[Async]_v2`, `cuMemcpy[Async]` (beserta varian `_ptds`/`_ptsz`) | Arah, ukuran, dan lama pemanggilan penyalinan memori | Nyala |
-| **P5** | `tp_btf` | `sched_switch`, `sched_wakeup` | Lama *thread* siap berjalan tetapi belum mendapat giliran (`runq_ns`), lama tidak berjalan (`offcpu_ns`), jumlah disela paksa | Nyala |
-| **P6** | `tp_btf` | `sched_process_fork`, `sched_process_exit` | Proses anak baru (misalnya EngineCore) otomatis ikut diamati, probe dilepas ketika proses berhenti | Nyala |
-| **P7** | `uprobe` + `uretprobe` | `cuMemAlloc_v2`, `cuMemAllocAsync(_ptsz)`, `cuMemFree_v2`, `cuMemFreeAsync(_ptsz)` | Waktu, ukuran, dan alamat alokasi memori GPU | Mati (`--enable P7`) |
-| **P8** | `tracepoint` | `syscalls:sys_enter_ioctl`, `sys_exit_ioctl` | Perkiraan kasar aktivitas driver (fd, nomor perintah, lama) | Mati (`--enable P8`) |
+| **P1** | `fentry` | `tcp_sendmsg`, `tcp_cleanup_rbuf`, `tcp_close` of the target, on the API server port (default 8000) | When a request arrives, when every token is sent, when the connection closes. Used to compute TTFT and TPOT on the server side | on |
+| **P2** | `uprobe` | `cuLaunchKernel`, `cuLaunchKernelEx`, `cuGraphLaunch` (and `_ptsz` variants) in `libcuda.so` | Number of kernel and graph launches, gaps between launches, longest gap | on |
+| **P3** | `uprobe` + `uretprobe` | `cuStreamSynchronize(_ptsz)`, `cuEventSynchronize`, `cuCtxSynchronize` | How long the CPU waits for the GPU; step boundaries | on |
+| **P4** | `uprobe` + `uretprobe` | `cuMemcpy{HtoD,DtoH,DtoD}[Async]_v2`, `cuMemcpy[Async]` (and `_ptds`/`_ptsz` variants) | Direction, size, and call duration of memory copies | on |
+| **P5** | `tp_btf` | `sched_switch`, `sched_wakeup` | Time runnable but waiting for a CPU (`runq_ns`), time off the CPU (`offcpu_ns`), preemptions | on |
+| **P6** | `tp_btf` | `sched_process_fork`, `sched_process_exit` | New child processes (for example EngineCore) are followed automatically; probes are detached when a process exits | on |
+| **P7** | `uprobe` + `uretprobe` | `cuMemAlloc_v2`, `cuMemAllocAsync(_ptsz)`, `cuMemFree_v2`, `cuMemFreeAsync(_ptsz)` | Time, size, and address of GPU memory allocations | off (`--enable P7`) |
+| **P8** | `tracepoint` | `syscalls:sys_enter_ioctl`, `sys_exit_ioctl` | Rough driver activity (fd, command, duration) | off (`--enable P8`) |
 
-Hal yang **tidak** diamati:
-- Waktu mulai dan selesai eksekusi kernel di GPU, karena agen tidak memakai CUPTI. Lama eksekusi di GPU disimpulkan dari lama menunggu pada P3.
-- Keadaan di dalam GPU (percabangan *warp*, akses memori).
-- Isi permintaan dan isi token. P1 hanya mencatat ukuran data dan waktu.
-- Keterlambatan jaringan setelah `send()` selesai di server.
+What is **not** observed:
+- Start and end of kernel execution on the GPU, because the agent does not use CUPTI. GPU time is inferred from the wait in P3.
+- State inside the GPU (warp divergence, memory access).
+- Request and token contents. P1 only records sizes and times.
+- Network delay after `send()` returns on the server.
 
-### Batas langkah dan mode ringkas
+### Step boundaries and summary mode
 
-Peluncuran kernel (P2) bisa terjadi ribuan kali per langkah inferensi, padahal satu *uprobe* di kernel butuh sekitar 2,56 µs.
-Karena itu P2 **tidak dikirim satu per satu** ke ruang pengguna.
-Data P2 dan P5 diringkas di dalam map per *thread*, lalu dikirim sebagai satu kejadian `step` setiap kali ada **batas langkah**.
-Batas langkah adalah kembalinya fungsi sinkronisasi (P3) atau `cuMemcpyDtoH` yang sinkron (P4).
+Kernel launches (P2) can happen thousands of times per inference step, and one in-kernel uprobe costs about 2.56 µs.
+P2 is therefore **not sent one by one** to user space.
+P2 and P5 data are summarized in a per-thread map and sent as one `step` event at every **step boundary**:
+the return of a synchronization call (P3) or of a blocking `cuMemcpyDtoH` (P4).
 
-| Mode | Perilaku | Cara memakai |
+| Mode | Behavior | How |
 |---|---|---|
-| ringkas (bawaan) | P2 hanya dihitung di kernel dan dikirim di dalam kejadian `step` | — |
-| rinci | Setiap peluncuran kernel juga dikirim sebagai kejadian `launch` | `--rinci`, atau kirim `SIGUSR1` ke heideltrace saat berjalan |
+| summary (default) | P2 is only counted in the kernel and reported inside `step` events | — |
+| detailed | every kernel launch is also sent as a `launch` event | `--detailed`, or send `SIGUSR1` to heideltrace while it runs |
 
-## Keamanan
+## Safety
 
-Agen ini dirancang untuk aman dijalankan di server bersama:
+The agent is designed to be safe on a shared server:
 
-1. **Hanya membaca.** Program eBPF tidak memakai `bpf_probe_write_user`, `bpf_override_return`, atau `bpf_send_signal`. Agen tidak dapat mengubah memori, nilai kembali, maupun alur proses yang diamati.
-2. **Lolos verifier kernel.** Setiap program diperiksa verifier sebelum berjalan sehingga tidak dapat merusak kernel. `--check` menjalankan pemeriksaan ini tanpa memasang probe apa pun.
-3. **Hanya proses sasaran.** Uprobe dipasang khusus pada PID sasaran dan proses anaknya, bukan pada seluruh sistem. Proses lain yang memakai `libcuda.so` (misalnya milik pengguna lain) **tidak terkena** biaya uprobe. Setiap program juga langsung berhenti jika kejadian bukan dari proses sasaran.
-4. **Memori terbatas.** Semua map punya batas ukuran (64 proses, 16.384 *thread*, ring buffer 4 MB). Map per *thread* memakai LRU sehingga tidak bisa penuh. Kejadian yang tidak muat dihitung sebagai `hilang` dan tidak membuat aplikasi tertahan.
-5. **Lepas otomatis.** Semua probe terikat pada *file descriptor* milik heideltrace. Probe otomatis dilepas oleh kernel ketika heideltrace berhenti, termasuk jika dimatikan paksa (`kill -9`) atau *crash*.
-6. **Tidak ada jaringan keluar.** Hasil hanya ditulis ke berkas lokal atau stdout.
-7. **Probe opsional tidak dimuat.** P7 dan P8 tidak dimuat ke kernel sama sekali kecuali diminta. Probe lain dapat dimatikan dengan `--disable`.
-8. **Tidak perlu menghentikan vLLM.** Agen dipasang dan dilepas ketika vLLM sedang berjalan.
+1. **Read-only.** No eBPF program uses `bpf_probe_write_user`, `bpf_override_return`, or `bpf_send_signal`. The agent cannot change memory, return values, or control flow of the observed process.
+2. **Checked by the kernel verifier.** Every program is verified before it runs, so it cannot crash the kernel. `--check` runs this check without attaching anything.
+3. **Target processes only.** Uprobes are attached to the target PID and its children, not system-wide. Other processes that use `libcuda.so` (for example other users) **do not pay** the uprobe cost. Every program also returns immediately for events from other processes.
+4. **Bounded memory.** Every map has a size limit (64 processes, 16,384 threads, 4 MB ring buffer). Per-thread maps are LRU so they cannot fill up. Events that do not fit are counted as `dropped` and never block the application.
+5. **Detached automatically.** All probes are tied to file descriptors owned by heideltrace. The kernel removes them when heideltrace exits, including on `kill -9` or a crash.
+6. **No network egress.** Results are only written to a local file or stdout.
+7. **Unused probes are not loaded.** The P5, P1, and P8 programs are not loaded into the kernel at all unless enabled.
+8. **No vLLM restart needed.** The agent attaches to and detaches from a running vLLM.
 
-Yang tetap perlu diperhatikan:
-- Agen butuh **root**. Minta izin pengelola server lab sebelum menjalankannya.
-- P2 menambah sekitar 2,56 µs per peluncuran kernel **pada proses sasaran**. Ukur dulu *overhead*-nya sebelum dipakai di luar pengujian.
-- P1 dan P5 memasang probe pada fungsi kernel yang dipakai seluruh sistem. Proses lain hanya terkena pemeriksaan PID yang sangat singkat, tetapi biaya ini tetap ada.
-- `scripts/count_cuda_calls.sh` memasang uprobe pada **semua** fungsi `cu*`. Jalankan hanya saat server uji tidak dipakai orang lain.
-- Repositori ini **tidak** berisi penyuntik gangguan (*fault injector*). Penyuntik gangguan akan dibuat terpisah dan hanya dijalankan dengan izin pengelola server.
+Things to keep in mind:
+- The agent needs **root**. Ask the lab server administrator before running it.
+- P2 adds about 2.56 µs per kernel launch **in the target process**. Measure the overhead before using it outside of experiments.
+- P1 and P5 hook kernel functions used by the whole system. Other processes only pay a very short PID check, but that cost exists.
+- `scripts/count_cuda_calls.sh` attaches uprobes to **every** `cu*` function. Only run it when nobody else is using the test server.
+- This repository does **not** contain the fault injector. It will be a separate tool and only run with the administrator's permission.
 
-## Kebutuhan sistem
+## Requirements
 
-| Komponen | Kebutuhan |
+| Component | Requirement |
 |---|---|
-| Kernel Linux | ≥ 5.15 (BPF cookie pada uprobe), dengan `CONFIG_DEBUG_INFO_BTF=y` |
-| Arsitektur | x86_64 (yang sudah diuji) |
-| Driver NVIDIA | Driver apa pun yang menyediakan `libcuda.so` |
-| Build | `clang` ≥ 11, `make`, `gcc`, `libelf-dev`, `zlib1g-dev`, `libssl-dev`, `pkg-config` |
-| Opsional | `bpftrace` untuk `scripts/count_cuda_calls.sh` |
-
-libbpf (v1.8.0) dan bpftool (v7.8.0) diambil dari submodule, jadi tidak perlu dipasang di sistem.
+| Linux kernel | ≥ 5.15 (BPF cookies on uprobes), with `CONFIG_DEBUG_INFO_BTF=y` |
+| Architecture | x86_64 |
+| NVIDIA driver | any driver that ships `libcuda.so` |
+| To build | Go ≥ 1.24 |
+| To change `bpf/` | additionally `clang` and `llvm-strip` (≥ 11) |
+| Optional | `bpftrace` for `scripts/count_cuda_calls.sh` |
 
 ## Build
 
 ```bash
-git clone --recursive https://github.com/sonix03/heideltrace.git
+git clone https://github.com/sonix03/heideltrace.git
 cd heideltrace
-# jika sudah di-clone tanpa --recursive:
-git submodule update --init --recursive
-
-sudo apt install clang llvm make gcc libelf-dev zlib1g-dev libssl-dev pkg-config
-make
+make            # -> build/heideltrace, a static binary
+make test       # unit tests, run on any OS
 ```
 
-Hasilnya `build/heideltrace`. `vmlinux.h` dibuat otomatis dari `/sys/kernel/btf/vmlinux` mesin build.
-Berkat CO-RE, biner yang sama dapat dijalankan pada versi kernel lain yang punya BTF.
+The compiled eBPF objects are committed under `internal/bpf/`, so building only needs Go.
+The binary can be built on a laptop (even on Windows with `GOOS=linux`) and copied to the GPU server as is.
+Thanks to CO-RE, the same binary runs on other kernel versions that have BTF.
 
-## Langkah pemakaian
+After editing anything under `bpf/`, regenerate the objects with `make generate` (needs clang) and commit the result.
+
+## Usage
 
 ```bash
-# 1. Periksa kesiapan mesin (hanya membaca, tidak mengubah apa pun)
-./scripts/check_env.sh            # atau: ./scripts/check_env.sh <PID vLLM>
+# 1. Check the machine (read-only, changes nothing)
+./scripts/check_env.sh            # or: ./scripts/check_env.sh <vLLM PID>
 
-# 2. Cari PID. Proses induk vLLM untuk P1, proses yang memakai GPU untuk P2-P4.
+# 2. Find the PIDs. The vLLM parent process for P1, the GPU process for P2-P4.
 pgrep -f "vllm serve"
 nvidia-smi --query-compute-apps=pid,process_name --format=csv
 
-# 3. Pastikan fungsi CUDA yang benar-benar dipanggil (sekali saja, sambil memberi beban)
-sudo ./scripts/count_cuda_calls.sh <PID GPU> 30
+# 3. Confirm which CUDA functions are really called (once, while sending load)
+sudo ./scripts/count_cuda_calls.sh <GPU PID> 30
 
-# 4. Uji verifier tanpa memasang probe
+# 4. Run the verifier without attaching any probe
 sudo ./build/heideltrace --check
 
-# 5. Jalankan agen. Cukup PID induk; proses anak ikut diamati otomatis.
-sudo ./build/heideltrace -p <PID vLLM> -o hasil.jsonl -d 120
+# 5. Run the agent. The parent PID is enough; child processes are followed.
+sudo ./build/heideltrace -p <vLLM PID> -o result.jsonl -d 120
 ```
 
-Contoh opsi lain:
+More examples:
 
 ```bash
-sudo ./build/heideltrace -p 1234 --disable P1          # tanpa pengamatan jaringan
-sudo ./build/heideltrace -p 1234 --enable P7,P8        # tambah probe opsional
-sudo ./build/heideltrace -p 1234 --port 8080 --rinci   # port lain, mode rinci
-sudo kill -USR1 $(pgrep heideltrace)                    # pindah mode saat berjalan
+sudo ./build/heideltrace -p 1234 --disable P1             # no network observation
+sudo ./build/heideltrace -p 1234 --enable P7,P8           # add the optional probes
+sudo ./build/heideltrace -p 1234 --port 8080 --detailed   # other port, detailed mode
+sudo kill -USR1 $(pgrep heideltrace)                      # switch mode while running
 ```
 
-Jika vLLM berjalan di dalam kontainer, gunakan PID yang terlihat oleh heideltrace (biasanya PID dari sisi host). `libcuda.so` dicari lewat `/proc/<PID>/root`, jadi tetap terdeteksi.
-Jika tidak terdeteksi, berikan lokasinya dengan `--libcuda`.
+If vLLM runs in a container, pass the PID as seen by heideltrace (usually the host PID). `libcuda.so` is found through `/proc/<PID>/root`, so it is still detected.
+If it is not, pass its location with `--libcuda`.
 
-Program eBPF selalu melihat PID versi kernel. Jika heideltrace sendiri berjalan di namespace PID lain (di dalam kontainer atau WSL), PID yang diberikan otomatis diterjemahkan dengan *task iterator*.
-Pada keluaran, `pid` adalah PID yang terlihat oleh heideltrace, sedangkan `tgid` dan `tid` adalah PID versi kernel.
+eBPF programs always see kernel PIDs. If heideltrace itself runs in another PID namespace (inside a container or WSL), the given PIDs are translated automatically with a task iterator.
+In the output, `pid` is the PID as seen by heideltrace, while `tgid` and `tid` are kernel PIDs.
 
-Titik pengamatan juga dapat dimatikan saat berjalan dengan menulis ke map kendali (indeks = nomor P, indeks 9 = mode):
+Probes can also be switched off at runtime by writing to the control map (index = probe number, index 9 = mode):
 
 ```bash
-sudo bpftool map update name control key 2 0 0 0 value 0 0 0 0   # matikan P2
+sudo bpftool map update name control key 2 0 0 0 value 0 0 0 0   # turn P2 off
 ```
 
-## Uji tanpa GPU
+## Tests without a GPU
 
-Dua uji asap dapat dijalankan pada mesin Linux mana pun tanpa GPU:
+Two smoke tests run on any Linux machine without a GPU:
 
 ```bash
 make
-sudo ./tests/smoke.sh       # P2-P4, P6, P7 dengan libcuda.so tiruan
-sudo ./tests/net_smoke.sh   # P1 dengan server HTTP Python lokal (butuh python3 dan curl)
+sudo ./tests/smoke.sh       # P2-P4, P6, P7 with a fake libcuda.so
+sudo ./tests/net_smoke.sh   # P1 with a local Python HTTP server (needs python3 and curl)
 ```
 
-`smoke.sh` membuat `libcuda.so.1` tiruan (`tests/fake_libcuda.c`) dan aplikasi yang meniru 13 langkah inferensi (`tests/fake_app.c`).
-Uji ini memeriksa jumlah kejadian `step`, `memcpy`, `alloc`, serta proses anak yang ikut diamati.
+`smoke.sh` builds a fake `libcuda.so.1` (`tests/fake_libcuda.c`) and an application that mimics 13 inference steps (`tests/fake_app.c`).
+It checks the number of `step`, `memcpy`, and `alloc` events and that the child process is followed.
 
-## Format keluaran
+## Output format
 
-Setiap baris adalah satu objek JSON. Semua `ts_ns` memakai `CLOCK_MONOTONIC`.
-Baris pertama (`meta`) berisi `mono_to_real_ns` untuk mengubahnya ke waktu nyata agar dapat dicocokkan dengan catatan pembangkit beban.
+Every line is one JSON object. All `ts_ns` values are `CLOCK_MONOTONIC`.
+The first line (`meta`) holds `mono_to_real_ns` to convert them to wall-clock time, so they can be matched with the load generator's records.
+The Go types in [`internal/event`](internal/event/event.go) define the schema.
 
-| `type` | Asal | Isi utama |
+| `type` | Source | Main fields |
 |---|---|---|
-| `meta` | — | versi, port, mode, daftar probe aktif |
-| *(semua)* | — | `ts_ns`, `pid`, `tgid`, `tid`, `comm` |
-| `step` | P3/P4 (+P2, P5) | `fn`, `wait_ns` (lama menunggu GPU), `launches`, `graphs`, `lead_ns`, `gap_sum_ns`, `gap_max_ns`, `runq_ns`, `offcpu_ns`, `preempt`, `switches` |
-| `launch` | P2, mode rinci | `fn`, `func` (handle CUfunction), `grid`, `block`, atau `graph` dan `stream` untuk CUDA Graph |
+| `meta` | — | version, port, mode, enabled probes |
+| *(all)* | — | `ts_ns`, `pid`, `tgid`, `tid`, `comm` |
+| `step` | P3/P4 (+P2, P5) | `fn`, `wait_ns` (time waiting for the GPU), `launches`, `graphs`, `lead_ns`, `gap_sum_ns`, `gap_max_ns`, `runq_ns`, `offcpu_ns`, `preempt`, `switches` |
+| `launch` | P2, detailed mode | `fn`, `func` (CUfunction handle), `grid`, `block`, or `graph` and `stream` for CUDA Graphs |
 | `memcpy` | P4 | `fn`, `dir` (`htod`/`dtoh`/`dtod`/`any`), `async`, `bytes`, `dur_ns`, `stream` |
 | `alloc` | P7 | `op` (`alloc`/`free`), `bytes`, `ptr`, `dur_ns` |
-| `net` | P1 | `dir` (`recv`/`send`/`close`), `bytes`, `sock` (penanda koneksi) |
+| `net` | P1 | `dir` (`recv`/`send`/`close`), `bytes`, `sock` (connection id) |
 | `proc_start` / `proc_exit` | P6 | `ppid` |
 | `ioctl` | P8 | `fd`, `cmd`, `dur_ns` |
 
-Contoh satu kejadian `step`:
+A sample `step` event:
 
 ```json
 {"ts_ns":81234567890,"pid":4021,"tgid":4021,"tid":4021,"comm":"VLLM::EngineCor","type":"step","fn":"cuStreamSynchronize","wait_ns":18234011,"handle":"0x0","ret":0,"launches":412,"graphs":3,"lead_ns":152331,"gap_sum_ns":2210554,"gap_max_ns":95012,"runq_ns":0,"offcpu_ns":0,"preempt":0,"switches":1}
 ```
 
-Pembacaan cepat yang sesuai dengan aturan diagnosis pada proposal:
-- `gap_*` membesar, `wait_ns` kecil, `runq_ns` besar → perebutan CPU oleh proses lain (kategori 1).
-- `gap_*` membesar, `wait_ns` kecil, `offcpu_ns` besar, `runq_ns` kecil → hambatan lain di sisi host (kategori 2).
-- `gap_*` normal, `wait_ns` jauh di atas data acuan → perebutan atau perlambatan GPU (kategori 3).
+Quick reading, following the diagnosis rules in the proposal:
+- `gap_*` grows, `wait_ns` small, `runq_ns` large → CPU contention from other processes (category 1).
+- `gap_*` grows, `wait_ns` small, `offcpu_ns` large, `runq_ns` small → other host-side stall (category 2).
+- `gap_*` normal, `wait_ns` far above the baseline → GPU contention or slowdown (category 3).
 
-## Keterbatasan yang diketahui
+## Known limitations
 
-- **Durasi `memcpy` varian `Async`** adalah lama pemanggilan di CPU, bukan lama transfer di GPU.
-- **Kernel di dalam CUDA Graph** tidak terlihat satu per satu. `graphs` menghitung peluncuran graf, bukan jumlah kernelnya.
-- **Ukuran blok pada `cuLaunchKernel`** hanya `blockX × blockY` karena `blockZ` ada di *stack*.
-- **Nama kernel** belum tersedia. Mode rinci baru mencatat handle `CUfunction`.
-- **P1 menganggap satu koneksi = satu permintaan dengan mode *streaming***. Penerimaan dideteksi lewat `tcp_cleanup_rbuf`. Jika fungsi ini tidak ada di kernel, bagian tersebut dimatikan otomatis dengan peringatan.
-- **Simbol beralias ganda:** jika dua nama simbol di `libcuda.so` menunjuk alamat yang sama, peluncuran bisa terhitung dua kali. Periksa dengan `count_cuda_calls.sh`.
-- **Panggilan internal libcudart:** `libcudart` bisa memanggil driver lewat penunjuk fungsi internal. Jika `count_cuda_calls.sh` menunjukkan fungsi yang diharapkan tidak pernah dipanggil, daftar `cuda_syms` di `src/heideltrace.c` perlu disesuaikan.
+- **`memcpy` duration for `Async` variants** is the CPU call time, not the transfer time on the GPU.
+- **Kernels inside a CUDA Graph** are not visible individually. `graphs` counts graph launches, not their kernels.
+- **Block size of `cuLaunchKernel`** is only `blockX × blockY`, because `blockZ` is on the stack.
+- **Kernel names** are not available yet. Detailed mode only records the `CUfunction` handle.
+- **P1 assumes one connection = one streaming request.** Receives are detected via `tcp_cleanup_rbuf`. If that function is missing in the kernel, that part is disabled with a warning.
+- **`offcpu_ns` includes sleeping inside a blocking synchronization**, so the correlator must separate off-CPU time inside and outside P3 calls.
+- **A full restart of vLLM is not followed.** Child processes are followed, but a new `vllm serve` with a new PID needs a new run (NF2 in the proposal is not complete yet).
+- **Aliased symbols:** if two symbol names in `libcuda.so` point to the same address, a launch may be counted twice. Check with `count_cuda_calls.sh`.
+- **libcudart internal calls:** libcudart may call the driver through internal function pointers. If `count_cuda_calls.sh` shows that an expected function is never called, adjust `CUDASymbols` in [`internal/abi/cuda.go`](internal/abi/cuda.go).
 
-## Struktur repositori
+## Roadmap
 
-```
-src/heideltrace.bpf.c       program eBPF (P1-P8)
-src/heideltrace.c           pemuat, pemasangan uprobe per PID, keluaran JSON Lines
-src/heideltrace.h           struktur data bersama kernel <-> ruang pengguna
-scripts/check_env.sh        pemeriksaan kesiapan mesin (hanya membaca)
-scripts/count_cuda_calls.sh penghitungan frekuensi fungsi cu* dengan bpftrace
-tests/                      uji asap tanpa GPU (libcuda.so tiruan, server HTTP lokal)
-libbpf/, bpftool/           submodule
-```
+- [ ] Run `count_cuda_calls.sh` against vLLM on the T4 server and adjust the symbol list.
+- [ ] Correlator: build step and request timelines from `step` and `net` events.
+- [ ] Analyzer: anomaly detection (99th percentile, TTFT regression) and the six cause categories.
+- [ ] Load generator (Poisson arrivals, streaming) that records client-side TTFT and TPOT.
+- [ ] Fault injector G1–G6, test environment only.
+- [ ] Overhead measurement per group of probes.
+- [ ] Re-attach automatically when vLLM is restarted (NF2).
 
-## Rencana berikutnya
+## License
 
-- [ ] Menjalankan `count_cuda_calls.sh` pada vLLM di server T4 dan menyesuaikan daftar simbol.
-- [ ] Pengorelasi: menyusun kejadian `step` dan `net` menjadi lini masa langkah dan permintaan.
-- [ ] Penganalisis: deteksi anomali (persentil ke-99, regresi TTFT) dan enam kategori penyebab.
-- [ ] Pembangkit beban (kedatangan Poisson) di repositori atau direktori terpisah.
-- [ ] Penyuntik gangguan G1–G6, hanya untuk lingkungan uji.
-- [ ] Pengukuran *overhead* per kelompok titik pengamatan.
-
-## Lisensi
-
-Program eBPF memakai lisensi `Dual BSD/GPL` karena beberapa helper eBPF hanya tersedia untuk program berlisensi GPL.
-Lisensi repositori belum ditentukan.
+The eBPF programs are licensed `Dual BSD/GPL` because some eBPF helpers are only available to GPL programs.
+The vendored libbpf headers in `bpf/headers/` are `LGPL-2.1 OR BSD-2-Clause`.
+The license of the rest of the repository has not been decided yet.
