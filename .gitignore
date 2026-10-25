@@ -2,3 +2,6 @@ build/
 *.o
 *.jsonl
 __pycache__/
+
+# bpf2go output is committed so that building needs only Go.
+!internal/bpf/*_bpfel.o
