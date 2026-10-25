@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #
-# Uji asap P1 tanpa GPU: mengamati server HTTP Python lokal yang menerima
-# tiga permintaan curl, lalu memeriksa kejadian net yang dihasilkan.
+# P1 smoke test without a GPU: observes a local Python HTTP server that
+# receives three curl requests, then checks the net events it produced.
 #
 #   make && sudo ./tests/net_smoke.sh
 #
@@ -12,9 +12,9 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TMP=$(mktemp -d)
 PORT=18000
 
-[ "$(id -u)" -eq 0 ] || { echo "Jalankan dengan sudo." >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
 command -v python3 >/dev/null && command -v curl >/dev/null ||
-	{ echo "Butuh python3 dan curl." >&2; exit 1; }
+	{ echo "Needs python3 and curl." >&2; exit 1; }
 
 python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$TMP" >/dev/null 2>&1 &
 SRV=$!
@@ -40,16 +40,16 @@ check() {
 	if [ "$2" -ge "$3" ]; then
 		echo "  [OK]    $1: $2"
 	else
-		echo "  [GAGAL] $1: $2 (diharapkan minimal $3)"
+		echo "  [FAIL]  $1: $2 (expected at least $3)"
 		FAIL=1
 	fi
 }
-echo "Hasil uji asap P1:"
-check "kejadian recv" "$RECV" 3
-check "kejadian send" "$SEND" 3
-check "koneksi berbeda" "$CONNS" 3
+echo "P1 smoke test results:"
+check "recv events" "$RECV" 3
+check "send events" "$SEND" 3
+check "distinct connections" "$CONNS" 3
 
 echo
-echo "Contoh kejadian net:"
+echo "Sample net events:"
 grep -m2 '"type":"net"' "$OUT"
 exit $FAIL

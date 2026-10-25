@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 /*
- * Aplikasi tiruan yang meniru pola satu langkah inferensi:
- * 20 peluncuran kernel, 1 peluncuran graf, salinan host -> GPU,
- * sinkronisasi, lalu salinan GPU -> host. Proses ini juga membuat satu
- * proses anak untuk menguji P6.
+ * Fake application that mimics one inference step:
+ * 20 kernel launches, 1 graph launch, a host -> GPU copy,
+ * a synchronization, then a GPU -> host copy. It also forks one child
+ * process to exercise P6.
  */
 #include <stddef.h>
 #include <stdio.h>
@@ -47,18 +47,18 @@ int main(void)
 {
 	pid_t child;
 
-	/* Beri waktu agar heideltrace selesai memasang probe. */
+	/* Give heideltrace time to attach its probes. */
 	sleep(2);
 
 	child = fork();
 	if (child == 0) {
-		sleep(2);	/* menunggu probe dipasang pada proses anak */
+		sleep(2);	/* wait for the probes on the child */
 		run_steps(3);
 		return 0;
 	}
 
 	run_steps(10);
 	waitpid(child, NULL, 0);
-	printf("fake_app selesai\n");
+	printf("fake_app done\n");
 	return 0;
 }

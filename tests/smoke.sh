@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #
-# Uji asap tanpa GPU: memasang heideltrace pada aplikasi tiruan yang memakai
-# libcuda.so tiruan, lalu memeriksa kejadian yang dihasilkan.
+# Smoke test without a GPU: attaches heideltrace to a fake application that
+# uses a fake libcuda.so, then checks the events it produced.
 #
 #   make && sudo ./tests/smoke.sh
 #
@@ -12,8 +12,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-[ "$(id -u)" -eq 0 ] || { echo "Jalankan dengan sudo." >&2; exit 1; }
-[ -x "$ROOT/build/heideltrace" ] || { echo "Jalankan make terlebih dahulu." >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
+[ -x "$ROOT/build/heideltrace" ] || { echo "Run make first." >&2; exit 1; }
 
 gcc -O1 -shared -fPIC -o "$TMP/libcuda.so.1" "$ROOT/tests/fake_libcuda.c"
 ln -s libcuda.so.1 "$TMP/libcuda.so"
@@ -33,21 +33,21 @@ expect() {
 	if [ "$got" -eq "$want" ]; then
 		echo "  [OK]    $name: $got"
 	else
-		echo "  [GAGAL] $name: $got (diharapkan $want)"
+		echo "  [FAIL]  $name: $got (expected $want)"
 		FAIL=1
 	fi
 }
 
-echo "Hasil uji asap:"
-# 13 langkah (10 induk + 3 anak), masing-masing 2 batas: sync dan DtoH sinkron
-expect "kejadian step"                  "$(count '"type":"step"')" 26
-expect "step dengan 20 peluncuran"      "$(count '"launches":20,"graphs":1')" 13
-expect "kejadian memcpy"                "$(count '"type":"memcpy"')" 26
-expect "kejadian alloc/free"            "$(count '"type":"alloc"')" 4
-expect "proses anak terdeteksi (P6)"    "$(count '"type":"proc_start"')" 1
-expect "proses berhenti (P6)"           "$(count '"type":"proc_exit"')" 2
+echo "Smoke test results:"
+# 13 steps (10 parent + 3 child), each with 2 boundaries: sync and blocking DtoH
+expect "step events"                "$(count '"type":"step"')" 26
+expect "steps with 20 launches"     "$(count '"launches":20,"graphs":1')" 13
+expect "memcpy events"              "$(count '"type":"memcpy"')" 26
+expect "alloc/free events"          "$(count '"type":"alloc"')" 4
+expect "child process seen (P6)"    "$(count '"type":"proc_start"')" 1
+expect "processes exited (P6)"      "$(count '"type":"proc_exit"')" 2
 
 echo
-echo "Contoh kejadian step:"
+echo "Sample step event:"
 grep -m1 '"launches":20' "$OUT"
 exit $FAIL

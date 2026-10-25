@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 /*
- * Pustaka tiruan bernama libcuda.so.1 dengan nama fungsi CUDA Driver API.
- * Dipakai untuk menguji heideltrace tanpa GPU. Fungsi sinkronisasi dan
- * penyalinan hanya tidur sebentar agar durasinya terukur.
+ * Fake library named libcuda.so.1 that exports CUDA Driver API names.
+ * Used to test heideltrace without a GPU. The synchronization and copy
+ * functions only sleep briefly so that their duration is measurable.
  */
 #include <stddef.h>
 #include <time.h>
