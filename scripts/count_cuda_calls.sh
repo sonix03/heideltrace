@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #
-# Menghitung pemanggilan setiap fungsi cu* pada libcuda.so oleh satu proses.
-# Hasilnya dipakai untuk memastikan fungsi mana yang benar-benar dipanggil
-# (misalnya cuLaunchKernel atau cuLaunchKernel_ptsz) sebelum agen dipakai.
+# Counts the calls of every cu* function in libcuda.so made by one process.
+# Use it to confirm which functions are really called (for example
+# cuLaunchKernel or cuLaunchKernel_ptsz) before relying on the agent.
 #
-#   sudo ./scripts/count_cuda_calls.sh PID [DETIK]
+#   sudo ./scripts/count_cuda_calls.sh PID [SECONDS]
 #
-# PID adalah proses yang memakai GPU, lihat:
+# PID is the process that uses the GPU, see:
 #   nvidia-smi --query-compute-apps=pid,process_name --format=csv
 #
-# PERHATIAN: skrip ini memasang uprobe pada SEMUA fungsi cu* (ratusan) di
-# proses tersebut sehingga proses akan melambat selama pengukuran. Jalankan
-# hanya di server uji, saat tidak ada pengguna lain, sambil memberi beban.
+# WARNING: this attaches a uprobe to EVERY cu* function (hundreds) of the
+# process, so it slows down while counting. Only run it on a test server
+# that nobody else is using, while sending load.
 #
 set -euo pipefail
 
@@ -23,23 +23,23 @@ fi
 PID=$1
 DUR=${2:-30}
 
-[ "$(id -u)" -eq 0 ] || { echo "Jalankan dengan sudo." >&2; exit 1; }
-command -v bpftrace >/dev/null || { echo "bpftrace tidak ditemukan." >&2; exit 1; }
-[ -d "/proc/$PID" ] || { echo "PID $PID tidak ditemukan." >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
+command -v bpftrace >/dev/null || { echo "bpftrace not found." >&2; exit 1; }
+[ -d "/proc/$PID" ] || { echo "PID $PID not found." >&2; exit 1; }
 
 LIB=$(grep -m1 -oE '/[^ ]*libcuda\.so[^ ]*' "/proc/$PID/maps" || true)
 if [ -z "$LIB" ]; then
-	echo "PID $PID belum memuat libcuda.so. Pilih proses yang memakai GPU." >&2
+	echo "PID $PID has not loaded libcuda.so. Pick the process that uses the GPU." >&2
 	exit 1
 fi
 LIB="/proc/$PID/root$LIB"
 
-echo "Menghitung pemanggilan cu* pada $LIB selama $DUR detik..." >&2
+echo "Counting cu* calls in $LIB for $DUR seconds..." >&2
 exec bpftrace -p "$PID" -e "
 uprobe:$LIB:cu* { @calls[func] = count(); }
 interval:s:$DUR { exit(); }
 END {
-	printf(\"\\nJumlah pemanggilan selama %d detik (terbanyak di bawah):\\n\", $DUR);
+	printf(\"\\nCalls in %d seconds (most frequent last):\\n\", $DUR);
 	print(@calls);
 	clear(@calls);
 }"
